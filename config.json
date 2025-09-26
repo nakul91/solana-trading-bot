@@ -1,0 +1,11 @@
+{
+  "rpc_url": "",
+  "initial_balance_usd": 1.0,
+  "price_check_interval_seconds": 10,
+  "swap_threshold_min_percent": 3.0,
+  "swap_threshold_max_percent": 5.0,
+  "max_swaps_per_day": 3,
+  "slippage_bps": 50,
+  "simulate_mode": true,
+  "priority_fee_microlamports": 10000
+}
