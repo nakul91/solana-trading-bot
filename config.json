@@ -1,6 +1,6 @@
 {
-  "wallet_address": "9ahgAweNCA47enoq4uQToPharKvJitGTt46xQy42fDgY",
-  "private_key": "5LRLsZc81h8GbnKMsUkp2WQKhhYhAZeCkKQ1nHJFGBUZdVJKpXgz3gfQox2GawcPhZbgU9SbJEzViiua4xYuELGC",
+  "wallet_address": "",
+  "private_key": "",
   "rpc_url": "https://api.mainnet-beta.solana.com",
   "initial_balance_usd": 1.0,
   "price_check_interval_seconds": 10,
