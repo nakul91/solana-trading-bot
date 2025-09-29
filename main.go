@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,12 +11,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"github.com/tyler-smith/go-bip39"
 )
 
 const (
@@ -42,23 +39,6 @@ type Config struct {
 	PriorityFeeMicrolamports   uint64  `json:"priority_fee_microlamports"`
 }
 
-func privateKeyFromSeedPhrase(mnemonic string) (solana.PrivateKey, error) {
-	// Validate mnemonic
-	if !bip39.IsMnemonicValid(mnemonic) {
-		return solana.PrivateKey{}, fmt.Errorf("invalid mnemonic phrase")
-	}
-
-	// Generate seed from mnemonic
-	seed := bip39.NewSeed(mnemonic, "")
-
-	// Use the first 32 bytes as the private key (standard for Solana)
-	if len(seed) < 32 {
-		return solana.PrivateKey{}, fmt.Errorf("seed too short")
-	}
-
-	privateKey := ed25519.NewKeyFromSeed(seed[:32])
-	return solana.PrivateKey(privateKey), nil
-}
 
 type QuoteResponse struct {
 	InputMint        string `json:"inputMint"`
@@ -98,24 +78,12 @@ func NewTradingBot(config Config) (*TradingBot, error) {
 	// Initialize Solana RPC client
 	rpcClient := rpc.New(config.RpcURL)
 
-	var privateKey solana.PrivateKey
-	var err error
-
-	// Try to parse as mnemonic first (if it contains spaces)
-	if strings.Contains(config.PrivateKey, " ") {
-		privateKey, err = privateKeyFromSeedPhrase(config.PrivateKey)
-		if err != nil {
-			return nil, fmt.Errorf("invalid seed phrase: %w", err)
-		}
-		log.Printf("Successfully loaded wallet from seed phrase")
-	} else {
-		// Try to parse as base58 private key
-		privateKey, err = solana.PrivateKeyFromBase58(config.PrivateKey)
-		if err != nil {
-			return nil, fmt.Errorf("invalid private key (not base58 or valid seed phrase): %w", err)
-		}
-		log.Printf("Successfully loaded wallet from base58 private key")
+	// Parse base58 private key
+	privateKey, err := solana.PrivateKeyFromBase58(config.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base58 private key: %w", err)
 	}
+	log.Printf("Successfully loaded wallet from base58 private key")
 
 	// Verify public key matches wallet address (if provided)
 	expectedPubkey := privateKey.PublicKey()
@@ -203,16 +171,16 @@ func (tb *TradingBot) shouldSwap(currentPrice float64) (bool, string) {
 	priceChangePercent := ((currentPrice - tb.lastSwapPrice) / tb.lastSwapPrice) * 100
 
 	minThreshold := tb.config.SwapThresholdMinPercent
-	maxThreshold := tb.config.SwapThresholdMaxPercent
+	//maxThreshold := tb.config.SwapThresholdMaxPercent
 
-	// If holding SOL and price increased by threshold range
-	if tb.currentAsset == "SOL" && priceChangePercent >= minThreshold && priceChangePercent <= maxThreshold {
+	// If holding SOL and price increased by at least minimum threshold
+	if tb.currentAsset == "SOL" && priceChangePercent >= minThreshold {
 		return true, fmt.Sprintf("SOL price increased by %.2f%% (%.2f -> %.2f), swapping to USDC",
 			priceChangePercent, tb.lastSwapPrice, currentPrice)
 	}
 
-	// If holding USDC and price decreased by threshold range
-	if tb.currentAsset == "USDC" && priceChangePercent <= -minThreshold && priceChangePercent >= -maxThreshold {
+	// If holding USDC and price decreased by at least minimum threshold
+	if tb.currentAsset == "USDC" && priceChangePercent <= -minThreshold {
 		return true, fmt.Sprintf("SOL price decreased by %.2f%% (%.2f -> %.2f), swapping to SOL",
 			priceChangePercent, tb.lastSwapPrice, currentPrice)
 	}
@@ -431,6 +399,83 @@ func (tb *TradingBot) waitForConfirmation(ctx context.Context, signature solana.
 	}
 }
 
+func (tb *TradingBot) getSOLBalance() (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use the wallet address from config, not derived address
+	walletPubkey := solana.MustPublicKeyFromBase58(tb.config.WalletAddress)
+	balance, err := tb.rpcClient.GetBalance(ctx, walletPubkey, rpc.CommitmentFinalized)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get SOL balance: %w", err)
+	}
+
+	// Convert lamports to SOL (9 decimals)
+	solBalance := float64(balance.Value) / 1000000000
+	return solBalance, nil
+}
+
+func (tb *TradingBot) getUSDCBalance() (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use the wallet address from config, not derived address
+	walletPubkey := solana.MustPublicKeyFromBase58(tb.config.WalletAddress)
+
+	// Get token accounts for USDC
+	usdcMint := solana.MustPublicKeyFromBase58(USDC_MINT)
+	tokenAccounts, err := tb.rpcClient.GetTokenAccountsByOwner(ctx, walletPubkey, &rpc.GetTokenAccountsConfig{
+		Mint: &usdcMint,
+	}, &rpc.GetTokenAccountsOpts{
+		Commitment: rpc.CommitmentFinalized,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to get USDC token accounts: %w", err)
+	}
+
+	if len(tokenAccounts.Value) == 0 {
+		return 0, nil // No USDC token account found
+	}
+
+	// Get balance from first token account
+	tokenAccount := tokenAccounts.Value[0]
+	balance, err := tb.rpcClient.GetTokenAccountBalance(ctx, tokenAccount.Pubkey, rpc.CommitmentFinalized)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get USDC balance: %w", err)
+	}
+
+	// Convert to USDC (6 decimals)
+	amount, err := strconv.ParseFloat(balance.Value.Amount, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse USDC amount: %w", err)
+	}
+	usdcBalance := amount / 1000000
+	return usdcBalance, nil
+}
+
+func (tb *TradingBot) getCurrentBalanceUSD(solPrice float64) (float64, string, error) {
+	solBalance, err := tb.getSOLBalance()
+	if err != nil {
+		return 0, "", err
+	}
+
+	usdcBalance, err := tb.getUSDCBalance()
+	if err != nil {
+		return 0, "", err
+	}
+
+	solUSD := solBalance * solPrice
+
+	// Determine which asset we're primarily holding
+	if solUSD > usdcBalance {
+		return solUSD, "SOL", nil
+	} else if usdcBalance > 0 {
+		return usdcBalance, "USDC", nil
+	} else {
+		return solUSD, "SOL", nil
+	}
+}
+
 func (tb *TradingBot) run() {
 	log.Printf("Starting Solana Trading Bot")
 	log.Printf("Initial balance: $%.2f in %s", tb.balance, tb.currentAsset)
@@ -453,6 +498,17 @@ func (tb *TradingBot) run() {
 				log.Printf("Error getting SOL price: %v", err)
 				continue
 			}
+
+			// Get real balance from blockchain
+			realBalance, currentAsset, err := tb.getCurrentBalanceUSD(price)
+			if err != nil {
+				log.Printf("Error getting real balance: %v", err)
+				continue
+			}
+
+			// Update bot state with real balance
+			tb.balance = realBalance
+			tb.currentAsset = currentAsset
 
 			log.Printf("Current SOL price: $%.2f | Holding: %s ($%.2f) | Last swap: $%.2f",
 				price, tb.currentAsset, tb.balance, tb.lastSwapPrice)

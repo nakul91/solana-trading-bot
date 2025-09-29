@@ -1,11 +1,13 @@
 {
-  "rpc_url": "",
+  "wallet_address": "9ahgAweNCA47enoq4uQToPharKvJitGTt46xQy42fDgY",
+  "private_key": "5LRLsZc81h8GbnKMsUkp2WQKhhYhAZeCkKQ1nHJFGBUZdVJKpXgz3gfQox2GawcPhZbgU9SbJEzViiua4xYuELGC",
+  "rpc_url": "https://api.mainnet-beta.solana.com",
   "initial_balance_usd": 1.0,
   "price_check_interval_seconds": 10,
-  "swap_threshold_min_percent": 3.0,
-  "swap_threshold_max_percent": 5.0,
+  "swap_threshold_min_percent": 1.0,
+  "swap_threshold_max_percent": 2.0,
   "max_swaps_per_day": 3,
   "slippage_bps": 50,
-  "simulate_mode": true,
+  "simulate_mode": false,
   "priority_fee_microlamports": 10000
 }
