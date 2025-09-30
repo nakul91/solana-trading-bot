@@ -37,17 +37,20 @@ type Config struct {
 	SlippageBps                int     `json:"slippage_bps"`
 	SimulateMode               bool    `json:"simulate_mode"`
 	PriorityFeeMicrolamports   uint64  `json:"priority_fee_microlamports"`
+	TestSwap                   bool    `json:"test_swap"`
 }
 
 
 type QuoteResponse struct {
-	InputMint        string `json:"inputMint"`
-	InAmount         string `json:"inAmount"`
-	OutputMint       string `json:"outputMint"`
-	OutAmount        string `json:"outAmount"`
+	InputMint        string  `json:"inputMint"`
+	InAmount         string  `json:"inAmount"`
+	OutputMint       string  `json:"outputMint"`
+	OutAmount        string  `json:"outAmount"`
 	OtherAmountThreshold string `json:"otherAmountThreshold"`
-	SwapMode         string `json:"swapMode"`
-	SlippageBps      int    `json:"slippageBps"`
+	SwapMode         string  `json:"swapMode"`
+	SlippageBps      int     `json:"slippageBps"`
+	PriceImpactPct   *string `json:"priceImpactPct,omitempty"`
+	RoutePlan        []interface{} `json:"routePlan,omitempty"`
 }
 
 type SwapRequest struct {
@@ -165,6 +168,9 @@ func getSolanaPrice(slippageBps int) (float64, error) {
 func (tb *TradingBot) shouldSwap(currentPrice float64) (bool, string) {
 	if tb.lastSwapPrice == 0 {
 		tb.lastSwapPrice = currentPrice
+		if tb.config.TestSwap {
+			return true, "Test swap - forcing initial swap"
+		}
 		return false, "Initial price set"
 	}
 
@@ -173,15 +179,16 @@ func (tb *TradingBot) shouldSwap(currentPrice float64) (bool, string) {
 	minThreshold := tb.config.SwapThresholdMinPercent
 	//maxThreshold := tb.config.SwapThresholdMaxPercent
 
-	// If holding SOL and price increased by at least minimum threshold
-	if tb.currentAsset == "SOL" && priceChangePercent >= minThreshold {
-		return true, fmt.Sprintf("SOL price increased by %.2f%% (%.2f -> %.2f), swapping to USDC",
+	// Dynamic trading: swap based on price direction regardless of current asset
+	// Price increased by threshold -> sell SOL for USDC (take profit)
+	if priceChangePercent >= minThreshold {
+		return true, fmt.Sprintf("SOL price increased by %.2f%% (%.2f -> %.2f), selling SOL for USDC",
 			priceChangePercent, tb.lastSwapPrice, currentPrice)
 	}
 
-	// If holding USDC and price decreased by at least minimum threshold
-	if tb.currentAsset == "USDC" && priceChangePercent <= -minThreshold {
-		return true, fmt.Sprintf("SOL price decreased by %.2f%% (%.2f -> %.2f), swapping to SOL",
+	// Price decreased by threshold -> buy SOL with USDC (buy the dip)
+	if priceChangePercent <= -minThreshold {
+		return true, fmt.Sprintf("SOL price decreased by %.2f%% (%.2f -> %.2f), buying SOL with USDC",
 			priceChangePercent, tb.lastSwapPrice, currentPrice)
 	}
 
@@ -197,21 +204,73 @@ func (tb *TradingBot) executeSwap(currentPrice float64) error {
 	var fromMint, toMint string
 	var amount int64
 
-	if tb.currentAsset == "SOL" {
-		// Swap SOL to USDC
-		fromMint = SOL_MINT
-		toMint = USDC_MINT
-		// Convert USD balance to SOL lamports (9 decimals)
-		amount = int64((tb.balance / currentPrice) * 1000000000)
+	// Calculate price change percentage from last swap
+	priceChangePercent := ((currentPrice - tb.lastSwapPrice) / tb.lastSwapPrice) * 100
+
+	// Dynamic asset selection based on configurable price thresholds
+	// If price dropped by threshold -> buy SOL with USDC (buy the dip)
+	// If price rose by threshold -> sell SOL for USDC (take profit)
+	var priceDirection string
+	if priceChangePercent <= -tb.config.SwapThresholdMinPercent {
+		priceDirection = "down"
+	} else if priceChangePercent >= tb.config.SwapThresholdMinPercent {
+		priceDirection = "up"
 	} else {
-		// Swap USDC to SOL
+		return fmt.Errorf("price change %.2f%% doesn't meet threshold (±%.1f%%)", priceChangePercent, tb.config.SwapThresholdMinPercent)
+	}
+
+	if priceDirection == "down" {
+		// Price dropped - use USDC to buy SOL
 		fromMint = USDC_MINT
 		toMint = SOL_MINT
-		// Convert USD balance to USDC (6 decimals)
-		amount = int64(tb.balance * 1000000)
+
+		// Get USDC balance and use config amount worth
+		usdcBalance, err := tb.getUSDCBalance()
+		if err != nil {
+			return fmt.Errorf("failed to get USDC balance: %w", err)
+		}
+
+		configAmountUSD := tb.config.InitialBalanceUSD
+		if usdcBalance < configAmountUSD {
+			return fmt.Errorf("insufficient USDC balance: have $%.2f, need $%.2f", usdcBalance, configAmountUSD)
+		}
+
+		// Convert config USD amount to USDC (6 decimals)
+		amount = int64(configAmountUSD * 1000000)
+		log.Printf("Price dropped %.2f%% to $%.2f - buying SOL with $%.2f USDC", priceChangePercent, currentPrice, configAmountUSD)
+
+	} else {
+		// Price rose - use SOL to get USDC
+		fromMint = SOL_MINT
+		toMint = USDC_MINT
+
+		// Get actual SOL balance from blockchain for verification
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		walletPubkey := solana.MustPublicKeyFromBase58(tb.config.WalletAddress)
+		walletBalance, err := tb.rpcClient.GetBalance(ctx, walletPubkey, rpc.CommitmentFinalized)
+		if err != nil {
+			return fmt.Errorf("failed to get SOL balance: %w", err)
+		}
+
+		// Calculate swap amount based on config USD amount
+		configAmountUSD := tb.config.InitialBalanceUSD
+		amount = int64((configAmountUSD / currentPrice) * 1000000000)
+
+		// Verify we have enough SOL in wallet for this swap
+		actualSolBalance := float64(walletBalance.Value) / 1000000000
+		requiredSolBalance := float64(amount) / 1000000000
+
+		if walletBalance.Value < uint64(amount) {
+			return fmt.Errorf("insufficient SOL in wallet: have %.6f SOL, need %.6f SOL", actualSolBalance, requiredSolBalance)
+		}
+
+		log.Printf("Price rose %.2f%% to $%.2f - selling $%.2f worth of SOL", priceChangePercent, currentPrice, configAmountUSD)
 	}
 
 	// Get quote for the swap
+	log.Printf("Requesting quote for amount: %d lamports (%.6f SOL)", amount, float64(amount)/1000000000)
 	quoteURL := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d",
 		JUPITER_QUOTE_API, fromMint, toMint, amount, tb.config.SlippageBps)
 
