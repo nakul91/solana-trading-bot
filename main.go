@@ -21,8 +21,8 @@ const (
 	SOL_MINT  = "So11111111111111111111111111111111111111112"
 	USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-	JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-	JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"
+	JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
+	JUPITER_SWAP_API  = "https://lite-api.jup.ag/swap/v1/swap"
 )
 
 type Config struct {
@@ -75,6 +75,9 @@ type TradingBot struct {
 	lastSwapReset   time.Time // Last time swap count was reset
 	rpcClient       *rpc.Client
 	wallet          solana.PrivateKey
+	// Cached balances (updated only during swaps)
+	cachedSOLBalance  float64 // SOL balance in SOL units
+	cachedUSDCBalance float64 // USDC balance in USD units
 }
 
 func NewTradingBot(config Config) (*TradingBot, error) {
@@ -96,7 +99,7 @@ func NewTradingBot(config Config) (*TradingBot, error) {
 		log.Printf("Using generated public key: %s", expectedPubkey.String())
 	}
 
-	return &TradingBot{
+	bot := &TradingBot{
 		config:        config,
 		currentAsset:  "SOL",
 		balance:       config.InitialBalanceUSD,
@@ -105,7 +108,18 @@ func NewTradingBot(config Config) (*TradingBot, error) {
 		lastSwapReset: time.Now(),
 		rpcClient:     rpcClient,
 		wallet:        privateKey,
-	}, nil
+	}
+
+	// Initialize cached balances at startup
+	err = bot.updateCachedBalances()
+	if err != nil {
+		log.Printf("Warning: Failed to get initial balances: %v", err)
+		// Set defaults to avoid crashes
+		bot.cachedSOLBalance = 0
+		bot.cachedUSDCBalance = 0
+	}
+
+	return bot, nil
 }
 
 func loadConfig(filename string) (Config, error) {
@@ -311,7 +325,13 @@ func (tb *TradingBot) executeSwap(currentPrice float64) error {
 		log.Printf("Swap executed successfully!")
 	}
 
-	// Update bot state
+	// Update cached balances after successful swap
+	err = tb.updateCachedBalances()
+	if err != nil {
+		log.Printf("Warning: Failed to update balances after swap: %v", err)
+	}
+
+	// Update bot state (keeping old logic for compatibility)
 	if tb.currentAsset == "SOL" {
 		tb.currentAsset = "USDC"
 		// Add 3% profit (simulate successful trade)
@@ -512,6 +532,27 @@ func (tb *TradingBot) getUSDCBalance() (float64, error) {
 	return usdcBalance, nil
 }
 
+func (tb *TradingBot) updateCachedBalances() error {
+	// Get SOL balance
+	solBalance, err := tb.getSOLBalance()
+	if err != nil {
+		return fmt.Errorf("failed to get SOL balance: %w", err)
+	}
+
+	// Get USDC balance
+	usdcBalance, err := tb.getUSDCBalance()
+	if err != nil {
+		return fmt.Errorf("failed to get USDC balance: %w", err)
+	}
+
+	// Cache the balances
+	tb.cachedSOLBalance = solBalance
+	tb.cachedUSDCBalance = usdcBalance
+
+	log.Printf("Updated cached balances: %.6f SOL, $%.2f USDC", solBalance, usdcBalance)
+	return nil
+}
+
 func (tb *TradingBot) getCurrentBalanceUSD(solPrice float64) (float64, string, error) {
 	solBalance, err := tb.getSOLBalance()
 	if err != nil {
@@ -558,19 +599,18 @@ func (tb *TradingBot) run() {
 				continue
 			}
 
-			// Get real balance from blockchain
-			realBalance, currentAsset, err := tb.getCurrentBalanceUSD(price)
-			if err != nil {
-				log.Printf("Error getting real balance: %v", err)
-				continue
+			// Calculate display values using cached balances
+			solUSD := tb.cachedSOLBalance * price
+			totalUSD := solUSD + tb.cachedUSDCBalance
+			primaryAsset := "SOL"
+			primaryValue := solUSD
+			if tb.cachedUSDCBalance > solUSD {
+				primaryAsset = "USDC"
+				primaryValue = tb.cachedUSDCBalance
 			}
 
-			// Update bot state with real balance
-			tb.balance = realBalance
-			tb.currentAsset = currentAsset
-
-			log.Printf("Current SOL price: $%.2f | Holding: %s ($%.2f) | Last swap: $%.2f",
-				price, tb.currentAsset, tb.balance, tb.lastSwapPrice)
+			log.Printf("Current SOL price: $%.2f | Holding: %s ($%.2f) | Total: $%.2f | Last swap: $%.2f",
+				price, primaryAsset, primaryValue, totalUSD, tb.lastSwapPrice)
 
 			shouldSwap, reason := tb.shouldSwap(price)
 			log.Printf("Swap decision: %s", reason)
